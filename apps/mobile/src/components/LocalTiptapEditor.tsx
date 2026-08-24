@@ -1,8 +1,6 @@
 'use dom';
 
-import "mermaid/dist/mermaid.min.js";
 import "katex/dist/katex.min.css";
-import { renderMermaidSVG, THEMES } from "beautiful-mermaid";
 import Image from "@tiptap/extension-image";
 import CodeBlock from "@tiptap/extension-code-block";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -56,6 +54,19 @@ import {
   getMobileEditorToolbarLabel,
   type MobileEditorToolbarActionId,
 } from "@edgeever/shared/mobile-editor";
+import {
+  type NoteImageTheme,
+  type NoteImageFontStyle,
+  type NoteImageFontSize,
+  type NoteImageCardWidth,
+  NOTE_IMAGE_CARD_WIDTH_PIXELS,
+  NOTE_IMAGE_BACKGROUND_COLORS,
+  NOTE_IMAGE_THEMES,
+  resolveTheme,
+  buildImageExportBasename,
+  buildNoteImageCardMarkup,
+  generateCardCss,
+} from "@edgeever/shared/note-image-card";
 import { useDOMImperativeHandle, type DOMImperativeFactory, type DOMProps } from "expo/dom";
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type ReactNode, type Ref, type SetStateAction } from "react";
 import {
@@ -93,6 +104,7 @@ export interface LocalTiptapEditorRef extends DOMImperativeFactory {
   replaceAll: (query: DOMValue, replacement: DOMValue) => void;
   search: (query: DOMValue, index: DOMValue) => void;
   pushAiStreamEvent: (payloadJson: DOMValue) => void;
+  exportImage: (requestJson: DOMValue) => void;
 }
 
 type LocalTiptapEditorSharedProps = {
@@ -103,6 +115,7 @@ type LocalTiptapEditorSharedProps = {
   onResourcePress?: (targetJson: string) => Promise<void>;
   onReady?: (startupMs: number) => Promise<void>;
   onSearchResult?: (count: number, index: number, query: string) => Promise<void>;
+  onImageExportEvent?: (payloadJson: string) => Promise<void>;
   ref: Ref<LocalTiptapEditorRef>;
   locale: "zh-CN" | "en-US";
   theme: "light" | "dark";
@@ -145,6 +158,38 @@ const TRANSIENT_IMAGE_UPLOAD_META = "edgeeverImageUploadPlaceholder";
 const ignoreSearchResult = async () => undefined;
 const ignoreAiRequest = async () => undefined;
 const AI_PROMPT_OPTION_PREFIX = "prompt:";
+const IMAGE_EXPORT_PIXEL_RATIO = 2;
+const IMAGE_EXPORT_CHUNK_SIZE = 256 * 1024;
+
+type ImageExportRequest = {
+  requestId: string;
+  format: "jpeg" | "png";
+  title: string;
+  fallbackTitle: string;
+  notebook?: string;
+  tags?: string[];
+  updatedAt?: string;
+  background?: "mint" | "slate" | "warm" | NoteImageTheme;
+  theme?: NoteImageTheme;
+  fontStyle?: NoteImageFontStyle;
+  fontSize?: NoteImageFontSize;
+  cardWidth?: NoteImageCardWidth;
+  showTitle?: boolean;
+  showNotebook?: boolean;
+  showTags?: boolean;
+  showUpdatedAt?: boolean;
+  branding?: boolean;
+};
+
+const blobToBytes = async (blob: Blob) => new Uint8Array(await blob.arrayBuffer());
+
+const bytesToBase64 = (bytes: Uint8Array) => {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+};
 
 const fallbackPromptParameterKind = (action: AiAction): AiPromptParameterKind =>
   action === "translate" ? "target-language" : action === "change-tone" ? "tone" : "none";
@@ -295,12 +340,18 @@ const handleMobileResourceEvent = (
   return false;
 };
 
-const getMobileMermaidTheme = (theme: "light" | "dark") => THEMES[theme === "dark" ? "zinc-dark" : "zinc-light"];
+let beautifulMermaidRuntime: Promise<typeof import("beautiful-mermaid")> | null = null;
 
-const renderWithBeautifulMermaid = (source: string, theme: "light" | "dark") => {
+const loadBeautifulMermaid = () => {
+  beautifulMermaidRuntime ??= import("beautiful-mermaid");
+  return beautifulMermaidRuntime;
+};
+
+const renderWithBeautifulMermaid = async (source: string, theme: "light" | "dark") => {
   try {
+    const { renderMermaidSVG, THEMES } = await loadBeautifulMermaid();
     return renderMermaidSVG(source, {
-      ...getMobileMermaidTheme(theme),
+      ...THEMES[theme === "dark" ? "zinc-dark" : "zinc-light"],
       transparent: true,
       font: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
       padding: 24,
@@ -344,7 +395,7 @@ const MermaidRenderRuntime = (props: MermaidRendererProps) => {
       const results: Array<{ source: string; svg: string | null }> = [];
       for (const source of sources) {
         try {
-          const beautifulSvg = renderWithBeautifulMermaid(source, props.theme);
+          const beautifulSvg = await renderWithBeautifulMermaid(source, props.theme);
           if (beautifulSvg) {
             results.push({ source, svg: inlineMermaidSvgStyles(beautifulSvg) });
             continue;
@@ -532,6 +583,7 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
   const onAiCancelRef = useRef(props.mode === "viewer" ? undefined : props.onAiCancel);
   const onReadyRef = useRef(props.onReady ?? (async () => undefined));
   const onSearchResultRef = useRef(props.onSearchResult ?? ignoreSearchResult);
+  const onImageExportEventRef = useRef(props.onImageExportEvent);
   const searchStateRef = useRef({ activeIndex: -1, query: "" });
   const [aiPanel, setAiPanel] = useState<MobileAiPanelState | null>(null);
   const [aiSelectionTrigger, setAiSelectionTrigger] = useState<MobileAiSelectionTriggerPosition | null>(null);
@@ -587,6 +639,7 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
   onAiCancelRef.current = props.mode === "viewer" ? undefined : props.onAiCancel;
   onReadyRef.current = props.onReady ?? (async () => undefined);
   onSearchResultRef.current = props.onSearchResult ?? ignoreSearchResult;
+  onImageExportEventRef.current = props.onImageExportEvent;
   const protectedImageExtension = useMemo(
     () => createProtectedImageExtension(
       props.baseUrl,
@@ -621,7 +674,9 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
 
   const editor = useEditor({
     editable: !isViewer,
-    autofocus: autoFocus ? "end" : false,
+    // Focus only after the DOM view reports ready. Initial TipTap autofocus plus
+    // the Android bridge retry raced each other and could leave the WebView stuck.
+    autofocus: false,
     extensions: [
       StarterKit.configure({ codeBlock: false, link: { openOnClick: false } }),
       TaskList,
@@ -1035,6 +1090,123 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
     }
   }, [aiUndoFingerprint, editor, props.baseUrl]);
 
+  const exportImage = useCallback((requestJsonValue: DOMValue) => {
+    if (typeof requestJsonValue !== "string" || !editor || editor.isDestroyed || !onImageExportEventRef.current) return;
+
+    void (async () => {
+      let request: ImageExportRequest;
+      try {
+        request = JSON.parse(requestJsonValue) as ImageExportRequest;
+        if (!request.requestId || (request.format !== "png" && request.format !== "jpeg")) return;
+      } catch {
+        return;
+      }
+
+      const notify = (payload: Record<string, unknown>) =>
+        onImageExportEventRef.current?.(JSON.stringify({ requestId: request.requestId, ...payload }));
+
+      const resolvedTheme = resolveTheme(request.background, request.theme);
+      const fontStyle = request.fontStyle ?? "serif";
+      const fontSize = request.fontSize ?? "lg";
+      const cardWidth = request.cardWidth ?? "standard";
+      const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || 680;
+      const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.slate;
+
+      const editorClone = editor.view.dom.cloneNode(true) as HTMLElement;
+      editorClone.removeAttribute("contenteditable");
+      editorClone.querySelectorAll("button, [contenteditable='true']").forEach((element) => {
+        element.removeAttribute("contenteditable");
+        if (element instanceof HTMLButtonElement) element.remove();
+      });
+
+      const bodyHtml = editorClone.innerHTML;
+
+      const host = document.createElement("div");
+      host.style.cssText = `position:fixed;left:-100000px;top:0;width:${targetWidth}px;pointer-events:none;`;
+      const style = document.createElement("style");
+      style.textContent = generateCardCss({ theme: resolvedTheme, fontStyle, fontSize, cardWidth });
+
+      const cardMarkup = buildNoteImageCardMarkup({
+        title: request.title || request.fallbackTitle,
+        notebook: request.notebook,
+        tags: request.tags,
+        updatedAt: request.updatedAt,
+        bodyHtml,
+        theme: resolvedTheme,
+        fontStyle,
+        showTitle: request.showTitle ?? true,
+        showNotebook: request.showNotebook ?? false,
+        showTags: request.showTags ?? false,
+        showUpdatedAt: request.showUpdatedAt ?? true,
+        showBranding: request.branding ?? true,
+      });
+
+      host.appendChild(style);
+      host.insertAdjacentHTML("beforeend", cardMarkup);
+      const documentRoot = host.lastElementChild as HTMLElement;
+      documentRoot.style.width = `${targetWidth}px`;
+      documentRoot.style.maxWidth = "none";
+      documentRoot.style.margin = "0";
+
+      document.body.appendChild(host);
+
+      try {
+        await document.fonts?.ready;
+        await Promise.all(Array.from(documentRoot.querySelectorAll("img")).map(async (image) => {
+          if (image.complete) return;
+          try { await image.decode(); } catch { /* Export the readable remainder. */ }
+        }));
+        const exportedImages = Array.from(
+          documentRoot.querySelectorAll<HTMLImageElement>(".edgeever-card-body img"),
+        );
+        const failedImages = exportedImages.filter((image) => !image.complete || image.naturalWidth === 0).length;
+        const totalHeight = Math.max(1, Math.ceil(documentRoot.getBoundingClientRect().height));
+        const backgroundColor = NOTE_IMAGE_BACKGROUND_COLORS[resolvedTheme] || themeCfg.canvasBg;
+
+        const { toCanvas } = await import("html-to-image");
+        const canvas = await toCanvas(documentRoot, {
+          backgroundColor,
+          cacheBust: false,
+          height: totalHeight,
+          pixelRatio: IMAGE_EXPORT_PIXEL_RATIO,
+          skipFonts: true,
+          width: targetWidth,
+        });
+        const blob = await new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob(
+            (result) => result ? resolve(result) : reject(new Error("Image renderer returned an empty file")),
+            request.format === "jpeg" ? "image/jpeg" : "image/png",
+            request.format === "jpeg" ? 0.92 : 1,
+          );
+        });
+
+        const extension = request.format === "jpeg" ? "jpg" : "png";
+        const basename = buildImageExportBasename(request.title, request.fallbackTitle);
+        const bytes = await blobToBytes(blob);
+        const filename = `${basename}.${extension}`;
+        const mimeType = request.format === "jpeg" ? "image/jpeg" : "image/png";
+
+        const base64 = bytesToBase64(bytes);
+        for (let offset = 0; offset < base64.length; offset += IMAGE_EXPORT_CHUNK_SIZE) {
+          await notify({ type: "chunk", chunk: base64.slice(offset, offset + IMAGE_EXPORT_CHUNK_SIZE) });
+        }
+        await notify({
+          type: "complete",
+          filename,
+          mimeType,
+          width: canvas.width,
+          height: canvas.height,
+          totalImages: exportedImages.length,
+          failedImages,
+        });
+      } catch (error) {
+        await notify({ type: "error", message: error instanceof Error ? error.message : "Image export failed" });
+      } finally {
+        host.remove();
+      }
+    })();
+  }, [editor]);
+
   useDOMImperativeHandle(
     props.ref,
     () => ({
@@ -1057,8 +1229,9 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
       replaceAll,
       search,
       pushAiStreamEvent,
+      exportImage,
     }),
-    [appendAttachment, beginImageUpload, cancelImageUpload, completeImageUpload, editor, flush, isViewer, pushAiStreamEvent, removeResource, renameResource, replaceAll, search, setContent]
+    [appendAttachment, beginImageUpload, cancelImageUpload, completeImageUpload, editor, exportImage, flush, isViewer, pushAiStreamEvent, removeResource, renameResource, replaceAll, search, setContent]
   );
 
   useEffect(() => {
@@ -1848,14 +2021,17 @@ const getMobileMermaidThemeVariables = (theme: "light" | "dark") => {
   };
 };
 
+let mermaidRuntime: Promise<typeof import("mermaid")["default"]> | null = null;
+
 const loadMermaid = () => {
-  const mermaid = (globalThis as typeof globalThis & {
-    mermaid?: typeof import("mermaid")["default"];
-  }).mermaid;
-  if (!mermaid) {
-    return Promise.reject(new Error("Mermaid runtime unavailable"));
-  }
-  return Promise.resolve(mermaid);
+  mermaidRuntime ??= import("mermaid/dist/mermaid.min.js").then(() => {
+    const mermaid = (globalThis as typeof globalThis & {
+      mermaid?: typeof import("mermaid")["default"];
+    }).mermaid;
+    if (!mermaid) throw new Error("Mermaid runtime unavailable");
+    return mermaid;
+  });
+  return mermaidRuntime;
 };
 
 const createMobileCodeBlockExtension = (
@@ -1966,7 +2142,7 @@ const createMobileCodeBlockExtension = (
           preview.replaceChildren(message);
           void loadMermaid()
             .then(async (mermaid) => {
-              const beautifulSvg = renderWithBeautifulMermaid(source, theme);
+              const beautifulSvg = await renderWithBeautifulMermaid(source, theme);
               if (beautifulSvg) {
                 return { svg: beautifulSvg };
               }

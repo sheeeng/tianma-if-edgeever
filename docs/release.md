@@ -33,8 +33,10 @@ stored in the tracking Issue, not in the public Release notes. Public notes
 contain only user-visible changes, impact, and necessary migration guidance.
 
 Use `--dry-run` to inspect commit coverage, the native rebuild plan, and notes.
-Use `--skip-install` only when the published macOS application should not be
-installed and launched after the Release.
+After publication, the command does not download, install, or launch the macOS
+application. Existing desktop installations receive new versions through the
+in-app automatic updater. Pass `--install-desktop` explicitly only when the
+previous installation check is actually needed.
 
 ## EdgeEver-Specific Behavior
 
@@ -51,11 +53,22 @@ installed and launched after the Release.
   Release asset rather than the overall GitHub tag. This prevents a Web-only or
   API-only Release from prompting an unnecessary native update.
 - The script creates the tracking Issue and Draft Release, validates or reuses
-  native assets, prepares the multi-platform Docker image, publishes, closes
-  the Issue, and installs the matching DMG.
+  native assets, prepares the multi-platform Docker image in both GHCR and the
+  public Tencent TCR mirror, publishes, and closes the Issue without installing
+  the desktop application by default; installation remains available as an
+  explicit option.
   Demo deployment continues independently after its Actions URL is printed.
 - Mobile store delivery is not part of this command. See
   [Mobile Store Delivery](store-delivery.md).
+
+## Registry Credentials
+
+The official repository must define `TENCENT_TCR_USERNAME` and
+`TENCENT_TCR_PASSWORD` Actions secrets. For the TCR Personal Edition registry,
+the username is the Tencent Cloud account ID and the password is the fixed
+registry password initialized in the TCR console. Draft preparation publishes
+the same tags to GHCR and TCR; both registries are checked anonymously before
+the Release can be published.
 
 ## Failure and Resume
 
@@ -64,5 +77,5 @@ installed and launched after the Release.
   run instead of creating another Issue, commit, or Release.
 - A failed post-publication native or Docker audit attempts to return the Release to
   Draft and leaves the Issue open.
-- If application replacement fails, the script restores the previous app from
-  its macOS Trash backup when possible.
+- If an explicit application installation fails, the script restores the previous
+  app from its macOS Trash backup when possible.

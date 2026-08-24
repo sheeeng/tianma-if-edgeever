@@ -40,6 +40,7 @@ import {
   CheckCircle2,
   TagX,
   Link2,
+  Share2,
   FileDown,
   FileCode2,
   Printer,
@@ -947,7 +948,7 @@ export const MemoListPane = ({
       tabIndex={0}
       onKeyDown={handleListKeyDown}
     >
-      <header className="border-b border-slate-200 bg-slate-50 px-4 pb-2 pt-[max(0.375rem,env(safe-area-inset-bottom))] lg:bg-white lg:py-3 lg:pt-3">
+      <header className="border-b border-slate-200 bg-slate-50 px-4 pb-2 pt-[max(0.375rem,env(safe-area-inset-bottom))] lg:bg-transparent lg:py-3 lg:pt-3">
         {selectionMode ? (
           <div className="mb-3 flex h-10 min-w-0 items-center gap-3 lg:hidden">
             <button
@@ -1578,6 +1579,13 @@ export const MemoListPane = ({
                   >
                     <Printer className="h-4 w-4 text-slate-500" />
                     {t("editor.exportPdf")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
+                    onClick={() => requestContextDocumentAction("share-image")}
+                  >
+                    <Share2 className="h-4 w-4 text-slate-500" />
+                    {t("editor.imageShare.action")}
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
