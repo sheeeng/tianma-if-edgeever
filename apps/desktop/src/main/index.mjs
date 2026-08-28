@@ -90,6 +90,7 @@ let sidecarRestartAttempts = 0;
 let sidecarRestartInFlight = false;
 let localDataResetScheduled = false;
 let rendererCrashDialogOpen = false;
+let recoveredAfterAbnormalExit = false;
 const updateCheckIntervalMs = 60 * 60 * 1_000;
 const updateCheckFocusThrottleMs = 15 * 60 * 1_000;
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -441,58 +442,60 @@ const createTray = () => {
   tray.on("double-click", () => showWindow(mainWindow));
 };
 
-const registerResourceProtocol = () => {
-  protocol.handle("edgeever-resource", async (request) => {
-    const resourceId = resourceIdFromRequest(request.url);
-    if (!resourceId) return new Response("Invalid resource", { status: 400 });
+const handleResourceProtocolRequest = async (request) => {
+  const resourceId = resourceIdFromRequest(request.url);
+  if (!resourceId) return new Response("Invalid resource", { status: 400 });
 
-    const directory = resourceCacheDirectory();
-    const bytesPath = join(directory, `${resourceId}.bin`);
-    const metadataPath = join(directory, `${resourceId}.json`);
+  const directory = resourceCacheDirectory();
+  const bytesPath = join(directory, `${resourceId}.bin`);
+  const metadataPath = join(directory, `${resourceId}.json`);
 
-    try {
-      const bytes = await readFile(bytesPath);
-      let metadata = {};
-      try { metadata = JSON.parse(await readFile(metadataPath, "utf8")); } catch {}
-      return cachedResourceResponse(bytes, metadata.contentType, request.headers.get("range"));
-    } catch {
-      // Fall through to the instance while online, then persist the response.
-    }
+  try {
+    const bytes = await readFile(bytesPath);
+    let metadata = {};
+    try { metadata = JSON.parse(await readFile(metadataPath, "utf8")); } catch {}
+    return cachedResourceResponse(bytes, metadata.contentType, request.headers.get("range"));
+  } catch {
+    // Fall through to the instance while online, then persist the response.
+  }
 
-    if (!configuredApiBaseUrl) return new Response("Resource is not cached", { status: 504 });
-    const sourceUrl = `${configuredApiBaseUrl}/api/v1/resources/${encodeURIComponent(resourceId)}/blob`;
-    try {
-      const cookies = await session.defaultSession.cookies.get({ url: sourceUrl });
-      const headers = resourceRequestHeaders({ cookies, sessionToken: desktopSessionToken });
-      const rangeHeader = request.headers.get("range");
-      if (rangeHeader) headers.set("range", rangeHeader);
-      const response = await net.fetch(sourceUrl, { headers });
-      if (!response.ok) return new Response("Resource request failed", { status: response.status });
-      const body = Buffer.from(await response.arrayBuffer());
-      if (response.status === 206) {
-        const responseHeaders = new Headers({
-          "Accept-Ranges": response.headers.get("accept-ranges") || "bytes",
-          "Cache-Control": "no-store",
-          "Content-Type": response.headers.get("content-type") || "application/octet-stream",
-        });
-        for (const name of ["content-length", "content-range", "etag", "last-modified"]) {
-          const value = response.headers.get(name);
-          if (value) responseHeaders.set(name, value);
-        }
-        return new Response(body, { status: 206, headers: responseHeaders });
+  if (!configuredApiBaseUrl) return new Response("Resource is not cached", { status: 504 });
+  const sourceUrl = `${configuredApiBaseUrl}/api/v1/resources/${encodeURIComponent(resourceId)}/blob`;
+  try {
+    const cookies = await session.defaultSession.cookies.get({ url: sourceUrl });
+    const headers = resourceRequestHeaders({ cookies, sessionToken: desktopSessionToken });
+    const rangeHeader = request.headers.get("range");
+    if (rangeHeader) headers.set("range", rangeHeader);
+    const response = await net.fetch(sourceUrl, { headers });
+    if (!response.ok) return new Response("Resource request failed", { status: response.status });
+    const body = Buffer.from(await response.arrayBuffer());
+    if (response.status === 206) {
+      const responseHeaders = new Headers({
+        "Accept-Ranges": response.headers.get("accept-ranges") || "bytes",
+        "Cache-Control": "no-store",
+        "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+      });
+      for (const name of ["content-length", "content-range", "etag", "last-modified"]) {
+        const value = response.headers.get(name);
+        if (value) responseHeaders.set(name, value);
       }
-      await mkdir(directory, { recursive: true });
-      await restrictDirectory(directory);
-      await writeFile(bytesPath, body, { mode: 0o600 });
-      await writeFile(metadataPath, JSON.stringify({ contentType: response.headers.get("content-type") || "application/octet-stream" }), { mode: 0o600 });
-      await restrictFile(bytesPath);
-      await restrictFile(metadataPath);
-      return cachedResourceResponse(body, response.headers.get("content-type"), null);
-    } catch (error) {
-      void writeDiagnostic("resource.cache-failed", { resourceId, message: error.message });
-      return new Response("Resource unavailable", { status: 504 });
+      return new Response(body, { status: 206, headers: responseHeaders });
     }
-  });
+    await mkdir(directory, { recursive: true });
+    await restrictDirectory(directory);
+    await writeFile(bytesPath, body, { mode: 0o600 });
+    await writeFile(metadataPath, JSON.stringify({ contentType: response.headers.get("content-type") || "application/octet-stream" }), { mode: 0o600 });
+    await restrictFile(bytesPath);
+    await restrictFile(metadataPath);
+    return cachedResourceResponse(body, response.headers.get("content-type"), null);
+  } catch (error) {
+    void writeDiagnostic("resource.cache-failed", { resourceId, message: error.message });
+    return new Response("Resource unavailable", { status: 504 });
+  }
+};
+
+const registerResourceProtocol = () => {
+  protocol.handle("edgeever-resource", handleResourceProtocolRequest);
 
   protocol.handle("edgeever-staged", async (request) => {
     const stagedId = resourceIdFromRequest(request.url);
@@ -884,8 +887,8 @@ app.whenReady().then(async () => {
   await loadConfiguredApiBaseUrl();
   await loadDesktopSessionToken();
   app.setAsDefaultProtocolClient("edgeever");
-  const previousSessionWasActive = existsSync(crashMarkerPath());
-  void writeDiagnostic(previousSessionWasActive ? "session.recovered-after-abnormal-exit" : "session.started");
+  recoveredAfterAbnormalExit = existsSync(crashMarkerPath());
+  void writeDiagnostic(recoveredAfterAbnormalExit ? "session.recovered-after-abnormal-exit" : "session.started");
   await writeFile(crashMarkerPath(), new Date().toISOString());
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   registerResourceProtocol();
@@ -929,6 +932,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.on("desktop:api-base-url-sync", (event) => { event.returnValue = configuredApiBaseUrl; });
   ipcMain.on("desktop:session-token-sync", (event) => { event.returnValue = desktopSessionToken; });
+  ipcMain.on("desktop:recovered-after-abnormal-exit-sync", (event) => { event.returnValue = recoveredAfterAbnormalExit; });
   ipcMain.handle("desktop:copy-text", (_event, value) => {
     if (typeof value !== "string") throw new Error("Clipboard value must be a string");
     clipboard.writeText(value);
@@ -1092,6 +1096,17 @@ app.whenReady().then(async () => {
     const metadata = JSON.parse(await readFile(join(directory, `${id}.json`), "utf8"));
     const bytes = await readFile(join(directory, `${id}.bin`));
     return { ...metadata, bytes: new Uint8Array(bytes) };
+  });
+  ipcMain.handle("desktop:read-resource", async (_event, id) => {
+    if (!isSafeResourceId(id)) throw new Error("Invalid resource id");
+    const response = await handleResourceProtocolRequest(new Request(
+      `edgeever-resource://resource/${encodeURIComponent(id)}`,
+    ));
+    if (!response.ok) throw new Error(`Resource request failed (${response.status})`);
+    return {
+      type: response.headers.get("content-type") || "application/octet-stream",
+      bytes: new Uint8Array(await response.arrayBuffer()),
+    };
   });
   ipcMain.handle("desktop:remove-staged-resource", async (_event, id) => {
     if (!isSafeResourceId(id)) throw new Error("Invalid staged resource id");
