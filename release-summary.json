@@ -1,17 +1,13 @@
 {
-  "version": "1.48.0",
+  "version": "1.50.0",
   "changes": {
     "en-US": [
-      "Expand system diagnostics across Web, desktop, Android, and iOS, with clearer cloud and client details for troubleshooting.",
-      "Make background synchronization more predictable and prevent the desktop editor from reloading after creating a note.",
-      "Refine memo list spacing for a more consistent Web layout.",
-      "Open Android updates in the correct app store or download destination for each installation source."
+      "System information now identifies whether a self-hosted Docker deployment is running the official EdgeEver image or a custom image, making support diagnostics clearer.",
+      "Windows Preview now launches the packaged interface reliably, avoids a missing Visual C++ runtime dependency, and shows actionable diagnostics instead of a silent white screen when startup fails."
     ],
     "zh-CN": [
-      "扩展 Web、桌面端、Android 和 iOS 的系统诊断信息，清晰区分云端与客户端详情，便于排查问题。",
-      "让后台同步节奏更稳定，并避免桌面端新建笔记后编辑器意外重新加载。",
-      "优化备忘录列表间距，使 Web 界面布局更加一致。",
-      "根据 Android 应用的安装来源，将更新正确引导至对应应用商店或下载地址。"
+      "系统信息现在会标识 Docker 自托管部署使用的是 EdgeEver 官方镜像还是自定义镜像，便于排查部署问题。",
+      "Windows 预览版现在可以可靠启动打包界面，不再依赖缺失的 Visual C++ 运行库；启动失败时会显示可操作的诊断信息，而不是无提示白屏。"
     ]
   }
 }

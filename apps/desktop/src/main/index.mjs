@@ -25,6 +25,12 @@ import { trayIconPath } from "./tray-icon.mjs";
 import { writeRichClipboard } from "./clipboard-write.mjs";
 import { LocalDataResetError, scheduleMacLocalDataReset } from "./local-data-reset.mjs";
 import { buildDesktopDiagnosticIssueUrl, normalizeDesktopDiagnostic } from "./desktop-diagnostics.mjs";
+import { createRendererStartupGuard } from "./renderer-startup-guard.mjs";
+import { waitForChildProcessSpawn } from "./child-process-start.mjs";
+import {
+  fetchTrustedWindowsUpdate,
+  verifyDownloadedWindowsUpdate,
+} from "./windows-update-trust.mjs";
 import electronUpdater from "electron-updater";
 
 const { autoUpdater } = electronUpdater;
@@ -82,6 +88,8 @@ let updateCheckTimer = null;
 let lastUpdateCheckAt = 0;
 let downloadedUpdateVersion = null;
 let promptedUpdateVersion = null;
+let trustedWindowsUpdate = null;
+let windowsDownloadedUpdateVerified = false;
 let sidecarScopeKey = "anonymous";
 let activeAccountId = null;
 let shutdownCleanupStarted = false;
@@ -90,6 +98,10 @@ let sidecarRestartAttempts = 0;
 let sidecarRestartInFlight = false;
 let localDataResetScheduled = false;
 let rendererCrashDialogOpen = false;
+let rendererStartupFailureDialogOpen = false;
+let rendererStartupGuard = null;
+let rendererUnresponsiveTimer = null;
+let rendererUnresponsiveDialogOpen = false;
 let recoveredAfterAbnormalExit = false;
 const updateCheckIntervalMs = 60 * 60 * 1_000;
 const updateCheckFocusThrottleMs = 15 * 60 * 1_000;
@@ -214,6 +226,90 @@ const handleRendererProcessGone = async (details) => {
   } finally {
     rendererCrashDialogOpen = false;
   }
+};
+
+const showRendererStartupFailure = async (details) => {
+  if (isQuitting || rendererStartupFailureDialogOpen || !mainWindow || mainWindow.isDestroyed()) return;
+  rendererStartupFailureDialogOpen = true;
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  const reason = String(details?.message || details?.errorDescription || details?.kind || "unknown").slice(0, 1000);
+  await writeDiagnostic("renderer.startup-failed", { ...details, reason });
+  try {
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: "error",
+      title: isChinese ? "EdgeEver 启动失败" : "EdgeEver failed to start",
+      message: isChinese ? "页面没有成功启动。错误已经写入诊断日志。" : "The page did not start successfully. The error was written to the diagnostic log.",
+      detail: `${reason}\n\n${logPath()}`,
+      buttons: isChinese ? ["打开日志位置", "重新加载", "关闭"] : ["Show log", "Reload", "Close"],
+      defaultId: 1,
+      cancelId: 2,
+    });
+    if (result.response === 0) shell.showItemInFolder(logPath());
+    if (result.response === 1 && mainWindow && !mainWindow.isDestroyed()) {
+      armRendererStartupGuard();
+      mainWindow.webContents.reload();
+    }
+  } finally {
+    rendererStartupFailureDialogOpen = false;
+  }
+};
+
+const armRendererStartupGuard = () => {
+  rendererStartupGuard?.complete();
+  rendererStartupGuard = createRendererStartupGuard({
+    onFailure: (details) => { void showRendererStartupFailure(details); },
+  });
+  rendererStartupGuard.arm();
+};
+
+const clearRendererUnresponsiveTimer = () => {
+  if (!rendererUnresponsiveTimer) return;
+  clearTimeout(rendererUnresponsiveTimer);
+  rendererUnresponsiveTimer = null;
+};
+
+const showRendererUnresponsive = async () => {
+  rendererUnresponsiveTimer = null;
+  if (isQuitting || rendererUnresponsiveDialogOpen || !mainWindow || mainWindow.isDestroyed()) return;
+  rendererUnresponsiveDialogOpen = true;
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  try {
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: "warning",
+      title: isChinese ? "EdgeEver 页面无响应" : "EdgeEver page is not responding",
+      message: isChinese ? "页面持续无响应。你可以重新加载或先查看诊断信息。" : "The page remains unresponsive. You can reload it or review diagnostics first.",
+      buttons: isChinese ? ["报告到 GitHub", "重新加载", "继续等待"] : ["Report to GitHub", "Reload", "Keep waiting"],
+      defaultId: 1,
+      cancelId: 2,
+    });
+    if (result.response === 0) await openDesktopDiagnosticIssue({ kind: "renderer-unresponsive" });
+    if ((result.response === 0 || result.response === 1) && mainWindow && !mainWindow.isDestroyed()) {
+      armRendererStartupGuard();
+      mainWindow.webContents.reload();
+    }
+  } finally {
+    rendererUnresponsiveDialogOpen = false;
+  }
+};
+
+const showMainStartupFailure = async (error) => {
+  const message = String(error?.message || error).slice(0, 2000);
+  await writeDiagnostic("main.startup-failed", { message, stack: error?.stack });
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  const options = {
+    type: "error",
+    title: isChinese ? "EdgeEver 无法启动" : "EdgeEver could not start",
+    message: isChinese ? "桌面应用启动失败。错误已经写入诊断日志。" : "The desktop application failed to start. The error was written to the diagnostic log.",
+    detail: `${message}\n\n${logPath()}`,
+    buttons: isChinese ? ["打开日志位置", "关闭"] : ["Show log", "Close"],
+    defaultId: 0,
+    cancelId: 1,
+  };
+  const result = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  if (result.response === 0) shell.showItemInFolder(logPath());
+  app.quit();
 };
 
 const execFileAsync = (command, argumentsList) => new Promise((resolve, reject) => {
@@ -539,12 +635,37 @@ const publishDesktopUpdateStatus = () => {
 };
 
 const installDownloadedUpdate = () => {
-  if (updateState !== "downloaded") return { started: false };
+  if (
+    updateState !== "downloaded" ||
+    (process.platform === "win32" && !windowsDownloadedUpdateVerified)
+  ) return { started: false };
   // The normal window close handler hides the app. Mark this as a real quit
   // before electron-updater closes windows so installation can proceed.
   isQuitting = true;
   autoUpdater.quitAndInstall(false, true);
   return { started: true };
+};
+
+const trackDesktopUpdateDownload = (downloadPromise, reason) => {
+  updateDownloadInFlight = Promise.resolve(downloadPromise)
+    .catch(async (error) => {
+      updateState = "idle";
+      downloadedUpdateVersion = null;
+      windowsDownloadedUpdateVerified = false;
+      refreshTrayMenu();
+      publishDesktopUpdateStatus();
+      await writeDiagnostic("update.download-failed", { reason, message: error.message });
+    })
+    .finally(() => { updateDownloadInFlight = null; });
+  return updateDownloadInFlight;
+};
+
+const downloadTrustedDesktopUpdate = (reason) => {
+  if (updateDownloadInFlight) return updateDownloadInFlight;
+  if (process.platform === "win32" && !trustedWindowsUpdate) {
+    return Promise.reject(new Error("Windows update metadata has not passed the signature gate"));
+  }
+  return trackDesktopUpdateDownload(autoUpdater.downloadUpdate(), reason);
 };
 
 const promptForDownloadedUpdate = async (version) => {
@@ -588,19 +709,32 @@ const checkForDesktopUpdate = (reason, { force = false, throwOnError = false } =
   lastUpdateCheckAt = now;
   void writeDiagnostic("update.check-started", { reason });
   updateCheckInFlight = autoUpdater.checkForUpdates()
-    .then((result) => {
+    .then(async (result) => {
+      if (process.platform === "win32" && result?.isUpdateAvailable) {
+        trustedWindowsUpdate = await fetchTrustedWindowsUpdate({
+          version: result.updateInfo.version,
+          updateInfo: result.updateInfo,
+          fetchImpl: net.fetch,
+        });
+        windowsDownloadedUpdateVerified = false;
+        void writeDiagnostic("update.windows-manifest-verified", {
+          version: trustedWindowsUpdate.version,
+          keyId: trustedWindowsUpdate.keyId,
+        });
+        void downloadTrustedDesktopUpdate(reason);
+      }
       if (result?.downloadPromise) {
-        updateDownloadInFlight = result.downloadPromise
-          .catch(async (error) => {
-            updateState = "idle";
-            refreshTrayMenu();
-            await writeDiagnostic("update.download-failed", { reason, message: error.message });
-          })
-          .finally(() => { updateDownloadInFlight = null; });
+        trackDesktopUpdateDownload(result.downloadPromise, reason);
       }
       return result;
     })
     .catch(async (error) => {
+      updateState = "idle";
+      downloadedUpdateVersion = null;
+      trustedWindowsUpdate = null;
+      windowsDownloadedUpdateVerified = false;
+      refreshTrayMenu();
+      publishDesktopUpdateStatus();
       await writeDiagnostic("update.check-failed", { reason, message: error.message });
       throw error;
     })
@@ -610,12 +744,16 @@ const checkForDesktopUpdate = (reason, { force = false, throwOnError = false } =
 
 const configureAutoUpdater = () => {
   if (!app.isPackaged || process.env.EDGE_EVER_DISABLE_AUTO_UPDATE === "1") return;
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoDownload = process.platform !== "win32";
+  autoUpdater.autoInstallOnAppQuit = process.platform !== "win32";
   autoUpdater.autoRunAppAfterInstall = true;
   autoUpdater.on("update-available", (info) => {
     updateState = "available";
     downloadedUpdateVersion = info?.version || null;
+    if (process.platform === "win32") {
+      trustedWindowsUpdate = null;
+      windowsDownloadedUpdateVerified = false;
+    }
     refreshTrayMenu();
     publishDesktopUpdateStatus();
     void writeDiagnostic("update.available", { version: info?.version });
@@ -623,20 +761,47 @@ const configureAutoUpdater = () => {
   autoUpdater.on("update-not-available", () => {
     updateState = "idle";
     downloadedUpdateVersion = null;
+    trustedWindowsUpdate = null;
+    windowsDownloadedUpdateVerified = false;
     refreshTrayMenu();
     publishDesktopUpdateStatus();
     void writeDiagnostic("update.not-available");
   });
   autoUpdater.on("download-progress", (progress) => { void writeDiagnostic("update.download-progress", { percent: progress.percent }); });
   autoUpdater.on("update-downloaded", (info) => {
-    updateState = "downloaded";
-    downloadedUpdateVersion = info?.version || downloadedUpdateVersion;
-    refreshTrayMenu();
-    publishDesktopUpdateStatus();
-    void writeDiagnostic("update.downloaded", { version: downloadedUpdateVersion });
-    void promptForDownloadedUpdate(downloadedUpdateVersion).catch((error) => {
-      promptedUpdateVersion = null;
-      void writeDiagnostic("update.prompt-failed", { message: error.message });
+    void (async () => {
+      if (process.platform === "win32") {
+        if (!trustedWindowsUpdate || trustedWindowsUpdate.version !== info?.version) {
+          throw new Error("Downloaded Windows update has no matching trusted manifest");
+        }
+        await verifyDownloadedWindowsUpdate({
+          path: info.downloadedFile,
+          manifest: trustedWindowsUpdate,
+        });
+        windowsDownloadedUpdateVerified = true;
+        autoUpdater.autoInstallOnAppQuit = true;
+      }
+      updateState = "downloaded";
+      downloadedUpdateVersion = info?.version || downloadedUpdateVersion;
+      refreshTrayMenu();
+      publishDesktopUpdateStatus();
+      await writeDiagnostic("update.downloaded", { version: downloadedUpdateVersion });
+      await promptForDownloadedUpdate(downloadedUpdateVersion).catch((error) => {
+        promptedUpdateVersion = null;
+        void writeDiagnostic("update.prompt-failed", { message: error.message });
+      });
+    })().catch(async (error) => {
+      if (process.platform !== "win32") {
+        await writeDiagnostic("update.download-handler-failed", { message: error.message });
+        return;
+      }
+      autoUpdater.autoInstallOnAppQuit = false;
+      updateState = "idle";
+      downloadedUpdateVersion = null;
+      windowsDownloadedUpdateVerified = false;
+      refreshTrayMenu();
+      publishDesktopUpdateStatus();
+      await writeDiagnostic("update.windows-package-blocked", { message: error.message });
     });
   });
   autoUpdater.on("error", (error) => {
@@ -644,6 +809,7 @@ const configureAutoUpdater = () => {
     if (updateState !== "downloaded") {
       updateState = "idle";
       downloadedUpdateVersion = null;
+      windowsDownloadedUpdateVerified = false;
     }
     refreshTrayMenu();
     publishDesktopUpdateStatus();
@@ -669,24 +835,37 @@ const startSidecar = async (accountId = null) => {
   const migrationsPath = app.isPackaged ? join(process.resourcesPath, "migrations") : join(projectRoot, "migrations");
   sidecarScopeKey = accountScopeKey(configuredApiBaseUrl, accountId);
   activeAccountId = accountId;
-  sidecarProcess = spawn(sidecarPath, ["--data-dir", sidecarDataDirectory(accountId), "--migrations-dir", migrationsPath], {
+  const spawnedProcess = spawn(sidecarPath, ["--data-dir", sidecarDataDirectory(accountId), "--migrations-dir", migrationsPath], {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
-  sidecarProcess.stderr.on("data", (chunk) => {
+  sidecarProcess = spawnedProcess;
+  let spawnedSuccessfully = false;
+  spawnedProcess.stderr.on("data", (chunk) => {
     const message = chunk.toString().trimEnd();
     console.error(`[sidecar] ${message}`);
     void writeDiagnostic("sidecar.stderr", { message });
   });
-  const processForExitHandler = sidecarProcess;
-  sidecarProcess.on("exit", (code, signal) => {
-    void writeDiagnostic("sidecar.exit", { code, signal });
-    if (sidecarProcess !== processForExitHandler || isQuitting) return;
+  spawnedProcess.on("error", (error) => {
+    void writeDiagnostic("sidecar.spawn-error", { message: error.message, code: error.code });
+    if (sidecarProcess !== spawnedProcess) return;
     sidecarProcess = null;
     sidecar = null;
-    scheduleSidecarRestart();
+    if (spawnedSuccessfully && !isQuitting) scheduleSidecarRestart();
   });
-  sidecar = new SidecarRpcClient(sidecarProcess);
+  spawnedProcess.on("exit", (code, signal) => {
+    void writeDiagnostic("sidecar.exit", { code, signal });
+    if (sidecarProcess !== spawnedProcess || isQuitting) return;
+    sidecarProcess = null;
+    sidecar = null;
+    if (spawnedSuccessfully) scheduleSidecarRestart();
+  });
+  await waitForChildProcessSpawn(spawnedProcess);
+  spawnedSuccessfully = true;
+  if (spawnedProcess.exitCode !== null || sidecarProcess !== spawnedProcess) {
+    throw new Error(`EdgeEver sidecar exited during startup (${spawnedProcess.exitCode ?? "unknown"})`);
+  }
+  sidecar = new SidecarRpcClient(spawnedProcess);
   return sidecar;
 };
 
@@ -742,6 +921,7 @@ const createWindow = async () => {
     },
   });
   rendererReady = false;
+  armRendererStartupGuard();
   if (state.isMaximized) mainWindow.maximize();
   mainWindow.on("resize", () => void saveWindowState());
   mainWindow.on("move", () => void saveWindowState());
@@ -764,12 +944,16 @@ const createWindow = async () => {
       validatedURL,
       isMainFrame,
     });
+    if (isMainFrame && errorCode !== -3) {
+      rendererStartupGuard?.fail({ kind: "load-failed", errorCode, errorDescription, validatedURL });
+    }
   });
   mainWindow.webContents.on("preload-error", (_event, preloadPath, error) => {
     void writeDiagnostic("renderer.preload-error", {
       preloadPath,
       message: String(error?.message || error).slice(0, 2000),
     });
+    rendererStartupGuard?.fail({ kind: "preload-error", message: String(error?.message || error).slice(0, 2000) });
   });
   mainWindow.webContents.on("console-message", (details) => {
     if (details.level !== "error") return;
@@ -783,11 +967,20 @@ const createWindow = async () => {
     void writeDiagnostic("renderer.loaded", { url: mainWindow?.webContents.getURL() || "" });
   });
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    clearRendererUnresponsiveTimer();
     void writeDiagnostic("renderer.gone", details);
     void handleRendererProcessGone(details);
   });
-  mainWindow.webContents.on("unresponsive", () => { void writeDiagnostic("renderer.unresponsive"); });
-  mainWindow.webContents.on("responsive", () => { void writeDiagnostic("renderer.responsive"); });
+  mainWindow.webContents.on("unresponsive", () => {
+    void writeDiagnostic("renderer.unresponsive");
+    if (!rendererUnresponsiveTimer && !rendererUnresponsiveDialogOpen) {
+      rendererUnresponsiveTimer = setTimeout(() => { void showRendererUnresponsive(); }, 5_000);
+    }
+  });
+  mainWindow.webContents.on("responsive", () => {
+    clearRendererUnresponsiveTimer();
+    void writeDiagnostic("renderer.responsive");
+  });
 
   try {
     if (app.isPackaged && !process.env.EDGE_EVER_DESKTOP_WEB_URL) {
@@ -844,7 +1037,7 @@ const confirmMacInstallation = async () => {
   void writeDiagnostic("installation.confirmed");
 };
 
-app.whenReady().then(async () => {
+const startApplication = async () => {
   applyMacDockIcon();
   if (app.isPackaged && isMountedInstallerPath(app.getAppPath())) {
     const isChinese = app.getLocale().toLowerCase().startsWith("zh");
@@ -896,7 +1089,10 @@ app.whenReady().then(async () => {
   await writeFile(crashMarkerPath(), new Date().toISOString());
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   registerResourceProtocol();
-  await startSidecar();
+  const initialSidecar = await startSidecar();
+  if (!initialSidecar) throw new Error("EdgeEver sidecar is unavailable");
+  await initialSidecar.waitUntilReady();
+  void writeDiagnostic("sidecar.ready", { scope: sidecarScopeKey });
   createTray();
 
   ipcMain.on("desktop:local-data-reset-available-sync", (event) => {
@@ -934,6 +1130,10 @@ app.whenReady().then(async () => {
     rendererReady = true;
     flushPendingDesktopCommands();
     flushPendingMarkdownImport();
+  });
+  ipcMain.on("desktop:renderer-bootstrap-ready", (event) => {
+    if (event.sender !== mainWindow?.webContents) return;
+    if (rendererStartupGuard?.complete()) void writeDiagnostic("renderer.bootstrap-ready");
   });
   ipcMain.on("desktop:api-base-url-sync", (event) => { event.returnValue = configuredApiBaseUrl; });
   ipcMain.on("desktop:session-token-sync", (event) => { event.returnValue = desktopSessionToken; });
@@ -1049,7 +1249,7 @@ app.whenReady().then(async () => {
     await checkForDesktopUpdate("manual", { force: true, throwOnError: true });
     return desktopUpdateStatus();
   });
-  ipcMain.handle("desktop:download-update", () => autoUpdater.downloadUpdate());
+  ipcMain.handle("desktop:download-update", () => downloadTrustedDesktopUpdate("manual-download"));
   ipcMain.handle("desktop:install-update", () => installDownloadedUpdate());
   ipcMain.handle("desktop:stage-resource", async (_event, input) => {
     const { memoId, name, type, bytes } = normalizeStagedResourceInput(input);
@@ -1134,6 +1334,13 @@ app.whenReady().then(async () => {
     if (!showWindow(mainWindow)) void createWindow();
     void checkForDesktopUpdate("activate");
   });
+};
+
+void app.whenReady().then(startApplication).catch((error) => {
+  void showMainStartupFailure(error).catch((dialogError) => {
+    console.error("Failed to show the desktop startup error", dialogError);
+    app.quit();
+  });
 });
 
 app.on("open-file", (event, filePath) => {
@@ -1155,6 +1362,8 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   shutdownCleanupStarted = true;
   isQuitting = true;
+  rendererStartupGuard?.complete();
+  clearRendererUnresponsiveTimer();
   if (sidecarRestartTimer) {
     clearTimeout(sidecarRestartTimer);
     sidecarRestartTimer = null;
