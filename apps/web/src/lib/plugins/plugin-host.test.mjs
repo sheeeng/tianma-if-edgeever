@@ -225,7 +225,7 @@ describe("EdgeEverPluginHost", () => {
     await host.runCommand("org.edgeever.test-plugin", "hello");
 
     expect(host.getSnapshot().commands).toHaveLength(7);
-    expect(host.getSnapshot().panels).toEqual([{ pluginId: "org.edgeever.test-plugin", id: "fixture", title: "Fixture panel", presentation: "dialog" }]);
+    expect(host.getSnapshot().panels).toEqual([{ pluginId: "org.edgeever.test-plugin", id: "fixture", title: "Fixture panel", purpose: "workflow", presentation: "dialog" }]);
     expect(notices).toEqual(["hello from plugin"]);
     await host.runCommand("org.edgeever.test-plugin", "read-without-permission");
     await host.runCommand("org.edgeever.test-plugin", "subscribe-without-read-permission");
@@ -555,6 +555,7 @@ describe("EdgeEverPluginHost", () => {
       () => { requestedPanelClose = true; },
     );
     expect(panelContainer.panelState).toEqual({ resourceId: "resource-1" });
+    expect(panelContainer.hasPanelShell).toBe(true);
     await panelContainer.requestPanelClose();
     expect(requestedPanelClose).toBe(true);
     disposePanel();

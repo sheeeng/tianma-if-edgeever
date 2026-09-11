@@ -1,15 +1,19 @@
 {
-  "version": "1.63.2",
+  "version": "1.65.1",
   "changes": {
     "en-US": [
-      "Fix GitHub marketplace plugin installs failing with Failed to fetch on desktop. The instance now resolves official releases and downloads plugin assets, so daily updates no longer need a client-side GitHub API round trip. Update both the instance and the desktop app.",
-      "Fix Docker/NAS upgrades that drop container environment variables, leaving login working while AI and object-storage credentials could no longer be encrypted and new model services could not be added. The encryption root is stored on the data volume and generated when missing; the add-service form no longer looks fillable while encryption is unavailable. If saved credentials cannot be decrypted, re-enter the API key.",
-      "Fix the AI settings pane crashing when provider names, base URLs, or tag-suggestion prompts are missing."
+      "Keep plugin panel close buttons in the header action row so they no longer overlap Refresh, Cancel, or Save.",
+      "Install and update GitHub plugins from public Release assets when api.github.com returns 401, 403, or 429.",
+      "Show only launcher commands on plugin marketplace cards, and keep the plugin toolbar menu to unique editor commands and dashboard panels.",
+      "Stop the memo-card hover tip from covering the New Note button.",
+      "Make diagram zoom percent editable, drop the Fit button, and keep large notes readable."
     ],
     "zh-CN": [
-      "修复桌面端从 GitHub 插件市场安装失败（Failed to fetch）的问题。实例会代为解析官方 Release 并下载插件，日常更新不再依赖客户端直接访问 GitHub。请同时更新实例和桌面端。",
-      "修复 Docker/NAS 升级丢掉容器环境变量后，登录仍可用但无法加密保存 AI 与对象存储凭据、也无法添加模型服务的问题。加密根密钥会写入数据卷，缺失时自动生成；加密仍不可用时“添加服务”不再呈现为可填写。若已保存的密钥无法解密，请重新填写 API Key。",
-      "修复 AI 设置在服务名称、接口地址或标签建议提示词缺失时崩溃的问题。"
+      "把插件面板关闭按钮放进标题操作行，避免压住刷新、取消或保存。",
+      "当 GitHub REST API 返回 401、403 或 429 时，改为下载公开 Release 资源来安装和更新插件。",
+      "插件市场卡片只保留启动命令，工具栏菜单只保留不重复的编辑器命令和仪表盘面板。",
+      "避免笔记卡片悬停提示挡住「新建笔记」按钮。",
+      "图文档缩放改为可输入百分比，去掉适应画布按钮，并让大笔记保持可读。"
     ]
   }
 }

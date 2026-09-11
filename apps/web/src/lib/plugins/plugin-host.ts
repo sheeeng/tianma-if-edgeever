@@ -17,8 +17,10 @@ import {
   type PluginNoteSummary,
   type PluginPanel,
   type PluginOpenNoteOptions,
+  type PluginPanelChrome,
   type PluginPanelCloseDecision,
   type PluginPanelOpenOptions,
+  normalizePluginPanelChrome,
   type PluginPermission,
   type PluginApiErrorCode,
   type PluginResource,
@@ -122,12 +124,15 @@ export interface RegisteredPluginCommand {
   pluginId: string;
   id: string;
   title: string;
+  listed?: boolean;
+  menu?: boolean;
 }
 
 export interface RegisteredPluginPanel {
   pluginId: string;
   id: string;
   title: string;
+  purpose?: "workflow" | "dashboard" | "preview" | "onboarding";
   presentation: "dialog" | "fullscreen";
 }
 
@@ -154,6 +159,10 @@ export interface PluginEditorAdapter {
 
 export interface PluginNavigationAdapter {
   openNote(noteId: string, notebookId: string, options?: PluginOpenNoteOptions): void | Promise<void>;
+}
+
+export interface PluginPanelChromeAdapter {
+  set(chrome: PluginPanelChrome): void;
 }
 
 export interface PluginPanelAdapter {
@@ -722,6 +731,7 @@ export class EdgeEverPluginHost {
     container: HTMLElement,
     options?: PluginPanelOpenOptions,
     onRequestClose?: () => void | Promise<void>,
+    chromeAdapter?: PluginPanelChromeAdapter,
   ) {
     const key = `${pluginId}:${panelId}`;
     const panel = this.panels.get(key);
@@ -732,6 +742,11 @@ export class EdgeEverPluginHost {
       state: normalizePanelState(options?.state),
       requestClose: async () => {
         await onRequestClose?.();
+      },
+      shell: {
+        set(chrome) {
+          chromeAdapter?.set(normalizePluginPanelChrome(chrome));
+        },
       },
     });
     if (this.panels.get(key) !== panel) {
@@ -1517,11 +1532,18 @@ export class EdgeEverPluginHost {
   private refreshSnapshot() {
     this.snapshot = {
       extensions: this.extensions.map((item) => ({ ...item, manifest: { ...item.manifest } })),
-      commands: [...this.commands.values()].map(({ pluginId, id, title }) => ({ pluginId, id, title })),
-      panels: [...this.panels.values()].map(({ pluginId, id, title, presentation }) => ({
+      commands: [...this.commands.values()].map(({ pluginId, id, title, listed, menu }) => ({
         pluginId,
         id,
         title,
+        listed: listed === false ? false : undefined,
+        menu: menu === false ? false : undefined,
+      })),
+      panels: [...this.panels.values()].map(({ pluginId, id, title, purpose, presentation }) => ({
+        pluginId,
+        id,
+        title,
+        purpose,
         presentation: presentation === "fullscreen" ? "fullscreen" : "dialog",
       })),
       embeds: [...this.embeds.values()].map(({ pluginId, type }) => ({ pluginId, type })),
